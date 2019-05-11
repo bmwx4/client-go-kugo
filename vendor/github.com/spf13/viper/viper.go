@@ -30,7 +30,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 
 	yaml "gopkg.in/yaml.v2"
@@ -187,7 +186,6 @@ type Viper struct {
 
 	automaticEnvApplied bool
 	envKeyReplacer      *strings.Replacer
-	allowEmptyEnv       bool
 
 	config         map[string]interface{}
 	override       map[string]interface{}
@@ -278,73 +276,48 @@ func (v *Viper) OnConfigChange(run func(in fsnotify.Event)) {
 }
 
 func WatchConfig() { v.WatchConfig() }
-
 func (v *Viper) WatchConfig() {
-	initWG := sync.WaitGroup{}
-	initWG.Add(1)
 	go func() {
 		watcher, err := fsnotify.NewWatcher()
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer watcher.Close()
+
 		// we have to watch the entire directory to pick up renames/atomic saves in a cross-platform way
 		filename, err := v.getConfigFile()
 		if err != nil {
-			log.Printf("error: %v\n", err)
+			log.Println("error:", err)
 			return
 		}
 
 		configFile := filepath.Clean(filename)
 		configDir, _ := filepath.Split(configFile)
-		realConfigFile, _ := filepath.EvalSymlinks(filename)
 
-		eventsWG := sync.WaitGroup{}
-		eventsWG.Add(1)
+		done := make(chan bool)
 		go func() {
 			for {
 				select {
-				case event, ok := <-watcher.Events:
-					if !ok { // 'Events' channel is closed
-						eventsWG.Done()
-						return
-					}
-					currentConfigFile, _ := filepath.EvalSymlinks(filename)
-					// we only care about the config file with the following cases:
-					// 1 - if the config file was modified or created
-					// 2 - if the real path to the config file changed (eg: k8s ConfigMap replacement)
-					const writeOrCreateMask = fsnotify.Write | fsnotify.Create
-					if (filepath.Clean(event.Name) == configFile &&
-						event.Op&writeOrCreateMask != 0) ||
-						(currentConfigFile != "" && currentConfigFile != realConfigFile) {
-						realConfigFile = currentConfigFile
-						err := v.ReadInConfig()
-						if err != nil {
-							log.Printf("error reading config file: %v\n", err)
-						}
-						if v.onConfigChange != nil {
+				case event := <-watcher.Events:
+					// we only care about the config file
+					if filepath.Clean(event.Name) == configFile {
+						if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+							err := v.ReadInConfig()
+							if err != nil {
+								log.Println("error:", err)
+							}
 							v.onConfigChange(event)
 						}
-					} else if filepath.Clean(event.Name) == configFile &&
-						event.Op&fsnotify.Remove&fsnotify.Remove != 0 {
-						eventsWG.Done()
-						return
 					}
-
-				case err, ok := <-watcher.Errors:
-					if ok { // 'Errors' channel is not closed
-						log.Printf("watcher error: %v\n", err)
-					}
-					eventsWG.Done()
-					return
+				case err := <-watcher.Errors:
+					log.Println("error:", err)
 				}
 			}
 		}()
+
 		watcher.Add(configDir)
-		initWG.Done()   // done initalizing the watch in this go routine, so the parent routine can move on...
-		eventsWG.Wait() // now, wait for event loop to end in this go-routine...
+		<-done
 	}()
-	initWG.Wait() // make sure that the go routine above fully ended before returning
 }
 
 // SetConfigFile explicitly defines the path, name and extension of the config file.
@@ -374,14 +347,6 @@ func (v *Viper) mergeWithEnvPrefix(in string) string {
 	return strings.ToUpper(in)
 }
 
-// AllowEmptyEnv tells Viper to consider set,
-// but empty environment variables as valid values instead of falling back.
-// For backward compatibility reasons this is false by default.
-func AllowEmptyEnv(allowEmptyEnv bool) { v.AllowEmptyEnv(allowEmptyEnv) }
-func (v *Viper) AllowEmptyEnv(allowEmptyEnv bool) {
-	v.allowEmptyEnv = allowEmptyEnv
-}
-
 // TODO: should getEnv logic be moved into find(). Can generalize the use of
 // rewriting keys many things, Ex: Get('someKey') -> some_key
 // (camel case to snake case for JSON keys perhaps)
@@ -389,14 +354,11 @@ func (v *Viper) AllowEmptyEnv(allowEmptyEnv bool) {
 // getEnv is a wrapper around os.Getenv which replaces characters in the original
 // key. This allows env vars which have different keys than the config object
 // keys.
-func (v *Viper) getEnv(key string) (string, bool) {
+func (v *Viper) getEnv(key string) string {
 	if v.envKeyReplacer != nil {
 		key = v.envKeyReplacer.Replace(key)
 	}
-
-	val, ok := os.LookupEnv(key)
-
-	return val, ok && (v.allowEmptyEnv || val != "")
+	return os.Getenv(key)
 }
 
 // ConfigFileUsed returns the file used to populate the config registry.
@@ -623,9 +585,10 @@ func (v *Viper) isPathShadowedInFlatMap(path []string, mi interface{}) string {
 //       "foo.bar.baz" in a lower-priority map
 func (v *Viper) isPathShadowedInAutoEnv(path []string) string {
 	var parentKey string
+	var val string
 	for i := 1; i < len(path); i++ {
 		parentKey = strings.Join(path[0:i], v.keyDelim)
-		if _, ok := v.getEnv(v.mergeWithEnvPrefix(parentKey)); ok {
+		if val = v.getEnv(v.mergeWithEnvPrefix(parentKey)); val != "" {
 			return parentKey
 		}
 	}
@@ -685,10 +648,8 @@ func (v *Viper) Get(key string) interface{} {
 			return cast.ToBool(val)
 		case string:
 			return cast.ToString(val)
-		case int32, int16, int8, int:
+		case int64, int32, int16, int8, int:
 			return cast.ToInt(val)
-		case int64:
-			return cast.ToInt64(val)
 		case float64, float32:
 			return cast.ToFloat64(val)
 		case time.Time:
@@ -811,6 +772,8 @@ func (v *Viper) UnmarshalKey(key string, rawVal interface{}, opts ...DecoderConf
 		return err
 	}
 
+	v.insensitiviseMaps()
+
 	return nil
 }
 
@@ -825,6 +788,8 @@ func (v *Viper) Unmarshal(rawVal interface{}, opts ...DecoderConfigOption) error
 	if err != nil {
 		return err
 	}
+
+	v.insensitiviseMaps()
 
 	return nil
 }
@@ -867,6 +832,8 @@ func (v *Viper) UnmarshalExact(rawVal interface{}) error {
 	if err != nil {
 		return err
 	}
+
+	v.insensitiviseMaps()
 
 	return nil
 }
@@ -998,7 +965,7 @@ func (v *Viper) find(lcaseKey string) interface{} {
 	if v.automaticEnvApplied {
 		// even if it hasn't been registered, if automaticEnv is used,
 		// check any Get request
-		if val, ok := v.getEnv(v.mergeWithEnvPrefix(lcaseKey)); ok {
+		if val = v.getEnv(v.mergeWithEnvPrefix(lcaseKey)); val != "" {
 			return val
 		}
 		if nested && v.isPathShadowedInAutoEnv(path) != "" {
@@ -1007,7 +974,7 @@ func (v *Viper) find(lcaseKey string) interface{} {
 	}
 	envkey, exists := v.env[lcaseKey]
 	if exists {
-		if val, ok := v.getEnv(envkey); ok {
+		if val = v.getEnv(envkey); val != "" {
 			return val
 		}
 	}
@@ -1172,7 +1139,7 @@ func (v *Viper) SetDefault(key string, value interface{}) {
 	deepestMap[lastKey] = value
 }
 
-// Set sets the value for the key in the override register.
+// Set sets the value for the key in the override regiser.
 // Set is case-insensitive for a key.
 // Will be used instead of values obtained via
 // flags, config file, ENV, default, or key/value store.
@@ -1253,21 +1220,13 @@ func (v *Viper) ReadConfig(in io.Reader) error {
 // MergeConfig merges a new configuration with an existing config.
 func MergeConfig(in io.Reader) error { return v.MergeConfig(in) }
 func (v *Viper) MergeConfig(in io.Reader) error {
+	if v.config == nil {
+		v.config = make(map[string]interface{})
+	}
 	cfg := make(map[string]interface{})
 	if err := v.unmarshalReader(in, cfg); err != nil {
 		return err
 	}
-	return v.MergeConfigMap(cfg)
-}
-
-// MergeConfigMap merges the configuration from the map given with an existing config.
-// Note that the map given may be modified.
-func MergeConfigMap(cfg map[string]interface{}) error { return v.MergeConfigMap(cfg) }
-func (v *Viper) MergeConfigMap(cfg map[string]interface{}) error {
-	if v.config == nil {
-		v.config = make(map[string]interface{})
-	}
-	insensitiviseMap(cfg)
 	mergeMaps(cfg, v.config, nil)
 	return nil
 }
@@ -1571,6 +1530,13 @@ func (v *Viper) WatchRemoteConfig() error {
 
 func (v *Viper) WatchRemoteConfigOnChannel() error {
 	return v.watchKeyValueConfigOnChannel()
+}
+
+func (v *Viper) insensitiviseMaps() {
+	insensitiviseMap(v.config)
+	insensitiviseMap(v.defaults)
+	insensitiviseMap(v.override)
+	insensitiviseMap(v.kvstore)
 }
 
 // Retrieve the first found remote configuration.
